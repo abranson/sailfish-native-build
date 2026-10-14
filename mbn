@@ -1,0 +1,388 @@
+#!/usr/bin/python3
+"""Build Sailfish RPMs natively, using the installed host toolchain."""
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+
+VERSION = "0.1.0"
+RESERVED = {"_topdir", "_builddir", "_buildrootdir", "_sourcedir", "_specdir",
+            "_rpmdir", "_srcrpmdir", "_rpmfilename", "_smp_mflags",
+            "_target", "_target_cpu", "_target_os", "_arch", "qtc_builddir"}
+
+
+class Error(Exception):
+    pass
+
+
+def run(argv, cwd=None, capture=True, check=True):
+    result = subprocess.run([str(a) for a in argv], cwd=cwd, text=True,
+                            stdout=subprocess.PIPE if capture else None,
+                            stderr=subprocess.PIPE if capture else None)
+    if check and result.returncode:
+        # Do not print argv: RPM macro values may contain private application keys.
+        raise Error("{} failed (exit {}){}".format(
+            Path(argv[0]).name, result.returncode,
+            ": " + result.stderr.strip() if capture else ""))
+    return result
+
+
+def inside(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def os_release():
+    values = {}
+    for line in Path("/etc/os-release").read_text().splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value.strip('"')
+    return values
+
+
+def preflight():
+    if os.geteuid() == 0:
+        raise Error("Run mbn as a normal user; only dependency installation is elevated.")
+    release = os_release()
+    if release.get("ID") != "sailfishos":
+        raise Error("This version requires a Sailfish OS host.")
+    for name in ("rpm", "rpmspec", "rpmbuild", "gcc", "g++", "make", "git", "rpmlint"):
+        if not shutil.which(name):
+            raise Error("Missing tool: {} (install sailfish-native-build).".format(name))
+    compiler = run(["gcc", "-dumpmachine"]).stdout.strip()
+    cxx = run(["g++", "-dumpmachine"]).stdout.strip()
+    arch = run(["rpm", "--eval", "%{_target_cpu}"]).stdout.strip()
+    machine = platform.machine()
+    native = architecture_family(machine)
+    if not native or any(architecture_family(a) != native for a in (compiler, cxx, arch)):
+        raise Error("Host, compilers and RPM must match a supported native architecture.")
+    if any(os.environ.get(k) for k in ("SBOX_TARGET_ROOT", "SB2_SESSION_DIR", "CROSS_COMPILE")):
+        raise Error("Leave the cross-compilation/SDK environment before running mbn.")
+    help_text = run(["rpmbuild", "--help"]).stdout
+    if "--build-in-place" not in help_text or "--noprep" not in help_text:
+        raise Error("Installed rpmbuild lacks Sailfish build-in-place support.")
+    return {"release": release, "architecture": arch, "machine": machine,
+            "compiler": compiler, "cxx_compiler": cxx,
+            "rpm": run(["rpm", "--version"]).stdout.strip()}
+
+
+def architecture_family(value):
+    cpu = value.split("-", 1)[0]
+    if cpu in ("aarch64", "x86_64"):
+        return cpu
+    if re.fullmatch(r"i[3-6]86", cpu):
+        return "x86"
+    if cpu == "arm" or re.fullmatch(r"armv[78](?:l|hl|hnl)", cpu):
+        return "arm32"
+    return None
+
+
+def definitions(items):
+    result = []
+    for item in items:
+        key = item.split(None, 1)[0] if item.strip() else ""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", key) or key in RESERVED:
+            raise Error("Invalid or builder-owned RPM macro: {}".format(key))
+        if key.startswith(("_target", "_host", "__cc", "__cxx")):
+            raise Error("Native toolchain macros cannot be overridden.")
+        if "\n" in item or "\r" in item:
+            raise Error("RPM definitions must be single-line values.")
+        result += ["--define", item]
+    return result
+
+
+def find_spec(project, requested):
+    if requested:
+        spec = (project / requested).resolve()
+    else:
+        specs = sorted((project / "rpm").glob("*.spec"))
+        if len(specs) != 1:
+            raise Error("Select one spec with --spec (found {} in rpm/).".format(len(specs)))
+        spec = specs[0].resolve()
+    if not spec.is_file() or not inside(spec, project):
+        raise Error("The spec must be a file inside the project directory.")
+    return spec
+
+
+def source_root(project):
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=project, check=False)
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else project
+
+
+@contextlib.contextmanager
+def workspace_lock(project):
+    state = project / ".mbn"
+    if state.is_symlink():
+        raise Error("Refusing a symlinked .mbn directory.")
+    state.mkdir(mode=0o700, exist_ok=True)
+    owner = state / "owner"
+    if owner.is_symlink():
+        raise Error("Invalid workspace ownership marker.")
+    if owner.exists():
+        if owner.read_text() != str(project):
+            raise Error("Workspace belongs to a different project.")
+    elif any(state.iterdir()):
+        raise Error("Refusing an unrecognized nonempty .mbn directory.")
+    else:
+        owner.write_text(str(project))
+    fd = os.open(str(state / "lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error("Another mbn command is running for this project.")
+        yield state
+
+
+def path_definition(name, path):
+    # Macro paths are used both as literal filenames by RPM and in shell
+    # scriptlets. Shell-quoting the macro would corrupt the literal filename.
+    value = str(path)
+    if any(c in value for c in '\n\r\t"\'`$%\\;&|<>(){}[]*?!#~'):
+        raise Error("RPM workspace paths cannot contain shell/RPM metacharacters.")
+    return ["--define", name + " " + value]
+
+
+def build_requires(spec, macro_args, cwd):
+    result = run(["rpmspec", "--query", "--buildrequires"] + macro_args + [str(spec)], cwd=cwd)
+    requirements = sorted(set(line.strip() for line in result.stdout.splitlines() if line.strip()))
+    if any(line.startswith("-") for line in requirements):
+        raise Error("Invalid BuildRequires expression.")
+    return requirements
+
+
+def install_dependencies(requirements):
+    if not requirements:
+        return
+    missing = [r for r in requirements
+               if run(["rpm", "--query", "--whatprovides", r], check=False).returncode]
+    if not missing:
+        print("All declared build dependencies are already installed.")
+        return
+    if not shutil.which("devel-su") or not shutil.which("zypper"):
+        raise Error("Dependency installation requires devel-su and zypper.")
+    if not sys.stdin.isatty():
+        raise Error("Run mbn deps interactively to accept the package transaction, then use --no-deps.")
+    print("Missing build dependencies:\n  " + "\n  ".join(missing), flush=True)
+    # devel-su takes argv directly. Keep zypper interactive; no -y/force/dup/GPG overrides.
+    run(["devel-su", "zypper", "--no-refresh", "install", "--no-recommends", "--"]
+        + requirements, capture=False)
+
+
+def rpm_inventory():
+    return sorted(run(["rpm", "-qa", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n"]).stdout.splitlines())
+
+
+def logged(argv, cwd, log):
+    with log.open("w") as stream:
+        process = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True,
+                                   errors="replace", bufsize=1, start_new_session=True)
+        try:
+            for line in process.stdout:
+                stream.write(line)
+                stream.flush()
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            return process.wait()
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise
+        finally:
+            process.stdout.close()
+
+
+def check_rpms(rpms, log_dir, native_arch):
+    if not rpms:
+        raise Error("No RPMs found to validate.")
+    results = []
+    for package in rpms:
+        arch = run(["rpm", "-qp", "--qf", "%{ARCH}", str(package)]).stdout.strip()
+        if arch not in (native_arch, "noarch"):
+            raise Error("Unexpected RPM architecture: {}".format(arch))
+        # Digests are checked independently of optional signing of local artifacts.
+        run(["rpm", "--checksig", "--nosignature", str(package)])
+        result = {"file": package.name, "architecture": arch,
+                  "sha256": hashlib.sha256(package.read_bytes()).hexdigest()}
+        log = log_dir / (package.name + ".rpmlint.log")
+        result["rpmlint_exit"] = logged(["rpmlint", str(package)], log_dir, log)
+        results.append(result)
+    return results
+
+
+def export_rpms(rpms, output):
+    output.mkdir(parents=True, exist_ok=True)
+    for package in rpms:
+        # Replace a finished RPM atomically, including across filesystems.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=output, prefix=".mbn-", delete=False) as stream:
+                temporary = Path(stream.name)
+                with package.open("rb") as source:
+                    shutil.copyfileobj(source, stream)
+            shutil.copymode(package, temporary)
+            os.replace(str(temporary), str(output / package.name))
+            package.unlink()
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+
+
+def write_json(path, data):
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def execute(args):
+    project = Path(args.project).resolve()
+    if not project.is_dir():
+        raise Error("Project directory does not exist.")
+    macro_args = definitions(args.define)
+    if os.geteuid() == 0:
+        raise Error("Run mbn as a normal user; only dependency installation is elevated.")
+    with workspace_lock(project) as state:
+        if args.command == "clean":
+            for path in state.glob("run-*"):
+                if path.is_dir() and not path.is_symlink() and (path / ".mbn-workspace").is_file():
+                    shutil.rmtree(path)
+            for name in ("rpm", "buildroot", "packages"):
+                path = state / name
+                if path.is_symlink():
+                    raise Error("Refusing a symlinked mbn staging directory.")
+                if path.is_dir():
+                    shutil.rmtree(path)
+            print("Removed mbn staging files; source build files, RPMs and logs were retained.")
+            return 0
+        host = preflight()
+        if args.command == "check":
+            if not args.rpm:
+                raise Error("Pass one or more RPM paths to mbn check.")
+            rpms = [Path(p).resolve(strict=True) for p in args.rpm]
+            log_dir = state
+            results = check_rpms(rpms, log_dir, host["architecture"])
+            write_json(log_dir / "checks.json", results)
+            print("Validation results: {}".format(log_dir))
+            return 1 if any(r["rpmlint_exit"] for r in results) else 0
+        spec = find_spec(project, args.spec)
+        # Check paths before any host dependency transaction.
+        path_definition("_builddir", project)
+        root = source_root(project)
+        output = Path(args.output_dir).resolve() if args.output_dir else project / "RPMS"
+        path_definition("_rpmdir", output)
+        if inside(project, output) or inside(output, state):
+            raise Error("Output must be separate from the source root and .mbn workspaces.")
+        work = state
+        for name in ("rpm", "buildroot", "packages"):
+            if (state / name).is_symlink():
+                raise Error("Refusing a symlinked mbn staging directory.")
+        build_macros = macro_args + path_definition("_topdir", work / "rpm")
+        build_macros += path_definition("_sourcedir", spec.parent)
+        requirements = build_requires(spec, build_macros, project)
+        if not args.no_deps:
+            install_dependencies(requirements)
+        if args.command == "deps":
+            print("Dependency resolution completed.")
+            return 0
+        artifacts = state / "packages"
+        if artifacts.exists():
+            shutil.rmtree(artifacts)
+        artifacts.mkdir()
+        manifest = {"tool_version": VERSION, "host": host, "source": {"mode": "in-place"},
+                    "project": str(project), "spec": str(spec.relative_to(root)),
+                    "build_requires": requirements, "installed_packages": rpm_inventory(),
+                    "status": "running", "workspace": str(work),
+                    "output_directory": str(output), "rpms": []}
+        if (root / ".git").exists():
+            head = run(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=False)
+            manifest["git_head"] = head.stdout.strip() if head.returncode == 0 else None
+            manifest["git_dirty"] = bool(run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root).stdout)
+            manifest["submodules"] = run(["git", "submodule", "status", "--recursive"], cwd=root).stdout.splitlines()
+        manifest_path = state / "manifest.json"
+        write_json(manifest_path, manifest)
+        command = ["rpmbuild", "--build-in-place", "-bb"] + build_macros
+        command += ["--define", "_smp_mflags -j{}".format(args.jobs)]
+        command += path_definition("_rpmdir", artifacts)
+        command += ["--buildroot", str(work / "buildroot")]
+        if not args.prep:
+            command += ["--noprep"]
+        command += [str(spec)]
+        print("Building in {}\nBuild log: {}".format(project, state / "build.log"), flush=True)
+        try:
+            rc = logged(command, project, state / "build.log")
+            manifest["build_exit"] = rc
+            if rc:
+                raise Error("rpmbuild failed (exit {}); see {}".format(rc, state / "build.log"))
+            rpms = sorted(artifacts.rglob("*.rpm"))
+            manifest["rpms"] = check_rpms(rpms, state, host["architecture"])
+            export_rpms(rpms, output)
+            manifest["status"] = "checks-failed" if any(r["rpmlint_exit"] for r in manifest["rpms"]) else "complete"
+            print("RPMs: {}\nLogs and manifest: {}".format(output, state))
+            return 1 if manifest["status"] == "checks-failed" else 0
+        except BaseException:
+            manifest["status"] = "failed"
+            raise
+        finally:
+            write_json(manifest_path, manifest)
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--version", action="version", version="mbn " + VERSION)
+    sub = result.add_subparsers(dest="command", required=True)
+    for command in ("build", "deps", "check", "clean"):
+        item = sub.add_parser(command)
+        item.add_argument("--project", default=".")
+        item.add_argument("-s", "--spec")
+        item.add_argument("--define", action="append", default=[], metavar="'NAME VALUE'")
+        if command in ("build", "deps"):
+            item.add_argument("--no-deps", action="store_true")
+            item.add_argument("--output-dir")
+        if command == "build":
+            item.add_argument("--prep", action="store_true", help="also execute %%prep in the source checkout")
+            item.add_argument("-j", "--jobs", type=int, default=min(4, os.cpu_count() or 1))
+        if command == "check":
+            item.add_argument("rpm", nargs="*")
+    return result
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if getattr(args, "jobs", 1) < 1:
+        raise Error("Job count must be positive.")
+    return execute(args)
+
+
+if __name__ == "__main__":
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(main())
+    except (Error, OSError) as error:
+        print("mbn: {}".format(error), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("mbn: interrupted; workspace and logs retained", file=sys.stderr)
+        sys.exit(130)

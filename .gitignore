@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.mbn/
+RPMS/
+dist/
+/TASK.md
+/AGENTS.md
