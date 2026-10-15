@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -91,7 +92,8 @@ class CommandTests(unittest.TestCase):
 
     def test_deps_no_root_or_shell_for_spec_and_exact_zypper_args(self):
         requirements = ["pkgconfig(Qt5Core) >= 5.6", "make"]
-        with patch.object(mbn, "run", side_effect=[result(code=1), result(), result()]) as call, \
+        with patch.object(mbn, "missing_dependencies", return_value=requirements[:1]), \
+                patch.object(mbn, "run", return_value=result()) as call, \
                 patch.object(mbn.shutil, "which", return_value="/bin/tool"), \
                 patch.object(mbn.sys.stdin, "isatty", return_value=True):
             mbn.install_dependencies(requirements)
@@ -101,20 +103,24 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("--non-interactive", argv)
 
     def test_noninteractive_deps_do_not_install(self):
-        with patch.object(mbn, "run", return_value=result(code=1)) as call, \
+        with patch.object(mbn, "missing_dependencies", return_value=["missing"]), \
+                patch.object(mbn, "run") as call, \
                 patch.object(mbn.shutil, "which", return_value="/bin/tool"), \
                 patch.object(mbn.sys.stdin, "isatty", return_value=False):
             with self.assertRaisesRegex(mbn.Error, "interactively"):
                 mbn.install_dependencies(["missing"])
-        self.assertEqual(call.call_count, 1)
+        call.assert_not_called()
 
     def test_installed_requirements_do_not_elevate(self):
-        with patch.object(mbn, "run", return_value=result()) as call:
+        with patch.object(mbn, "missing_dependencies", return_value=[]) as check, \
+                patch.object(mbn, "run") as call:
             mbn.install_dependencies(["make"])
-        self.assertEqual(call.call_count, 1)
+        check.assert_called_once_with(["make"])
+        call.assert_not_called()
 
     def test_dependency_transaction_failure_stops(self):
-        with patch.object(mbn, "run", side_effect=[result(code=1), mbn.Error("refused")]), \
+        with patch.object(mbn, "missing_dependencies", return_value=["missing"]), \
+                patch.object(mbn, "run", side_effect=mbn.Error("refused")), \
                 patch.object(mbn.shutil, "which", return_value="/bin/tool"), \
                 patch.object(mbn.sys.stdin, "isatty", return_value=True):
             with self.assertRaisesRegex(mbn.Error, "refused"):
@@ -344,6 +350,41 @@ sys.exit(7)
                 mbn.logged(["rpmbuild"], temporary, Path(temporary) / "build.log")
             self.assertTrue(popen.call_args[1]["start_new_session"])
             kill.assert_called_once_with(12345, mbn.signal.SIGTERM)
+
+
+@unittest.skipUnless(importlib.util.find_spec("rpm") and shutil.which("rpm"),
+                     "requires native RPM tools and bindings")
+class DependencyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if subprocess.run(["rpm", "-q", "rpm"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode:
+            raise unittest.SkipTest("requires an RPM-managed host")
+
+    def test_installed_versioned_capability(self):
+        self.assertEqual(mbn.missing_dependencies(["rpm >= 0"]), [])
+
+    def test_insufficient_version_and_missing_capability(self):
+        requirements = ["rpm >= 999999:1", "mbn-test-nonexistent-capability"]
+        self.assertEqual(mbn.missing_dependencies(requirements), requirements)
+
+    def test_exact_evr_and_strict_inequalities(self):
+        evr = subprocess.check_output(
+            ["rpm", "-q", "rpm", "--qf", "%{EPOCHNUM}:%{VERSION}-%{RELEASE}"],
+            text=True)
+        self.assertEqual(mbn.missing_dependencies(["rpm = " + evr]), [])
+        requirements = ["rpm > " + evr, "rpm < " + evr]
+        self.assertEqual(mbn.missing_dependencies(requirements), requirements)
+
+    def test_file_and_rich_dependencies(self):
+        requirements = ["/usr/bin/rpm", "(rpm or mbn-test-nonexistent-capability)"]
+        self.assertEqual(mbn.missing_dependencies(requirements), [])
+        missing = "(rpm and mbn-test-nonexistent-capability)"
+        self.assertEqual(mbn.missing_dependencies([missing]), [missing])
+
+    def test_invalid_requirement_fails_closed(self):
+        with self.assertRaisesRegex(mbn.Error, "Invalid BuildRequires"):
+            mbn.missing_dependencies(["rpm >= 1 unexpected"])
 
 
 if __name__ == "__main__":

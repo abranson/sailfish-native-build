@@ -1,6 +1,6 @@
 Name:           sailfish-native-build
 Version:        0.1.0
-Release:        3
+Release:        4
 Summary:        Native Sailfish OS RPM build command
 License:        MIT
 Group:          Development/Tools
@@ -8,7 +8,9 @@ BuildArch:      noarch
 Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  python3-base >= 3.7
 BuildRequires:  git
+BuildRequires:  rpm-python
 Requires:       python3-base >= 3.7
+Requires:       rpm-python
 Requires:       bash
 Requires:       gcc
 Requires:       gcc-c++
@@ -44,7 +46,7 @@ provenance. It does not use SDK targets, Scratchbox2 or emulation.
 %setup -q
 
 %build
-# The command uses only Python's standard library.
+# No compilation is needed.
 
 %install
 install -D -m 0755 mbn %{buildroot}%{_bindir}/mbn
@@ -58,6 +60,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 %{_bindir}/mbn
 
 %changelog
+* Thu Oct 15 2026 Andrew Branson <andrew.branson@jolla.com> - 0.1.0-4
+- Check versioned build requirements using RPM dependency resolution.
+
 * Wed Oct 14 2026 Andrew Branson <andrew.branson@jolla.com> - 0.1.0-3
 - Add native in-place RPM builds with dependency installation and validation.
 - Stream build output and export RPMs directly to the project output directory.

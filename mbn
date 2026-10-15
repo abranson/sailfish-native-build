@@ -166,11 +166,52 @@ def build_requires(spec, macro_args, cwd):
     return requirements
 
 
+def missing_dependencies(requirements):
+    try:
+        import rpm
+    except ImportError:
+        raise Error("Dependency checks require rpm-python (install sailfish-native-build).")
+
+    flags = {"": 0, "=": rpm.RPMSENSE_EQUAL, "<": rpm.RPMSENSE_LESS,
+             ">": rpm.RPMSENSE_GREATER,
+             "<=": rpm.RPMSENSE_LESS | rpm.RPMSENSE_EQUAL,
+             ">=": rpm.RPMSENSE_GREATER | rpm.RPMSENSE_EQUAL}
+    dependencies = []
+    for requirement in requirements:
+        if requirement.startswith("("):
+            # Let RPM evaluate rich dependencies, including boolean operators.
+            dependencies.append((requirement, "", 0))
+            continue
+        match = re.fullmatch(r"(\S+)(?:\s+(<=|>=|=|<|>)\s+(\S+))?", requirement)
+        if not match:
+            raise Error("Invalid BuildRequires expression: {}".format(requirement))
+        name, operator, version = match.groups()
+        dependencies.append((name, version or "", flags[operator or ""]))
+
+    # Check an in-memory package against the installed database. Never run the
+    # transaction: RPM handles versions, file provides and rich dependencies.
+    missing = []
+    for requirement, (name, version, sense) in zip(requirements, dependencies):
+        header = rpm.hdr()
+        for key, value in (("name", "mbn-build-dependencies"), ("version", "1"),
+                           ("release", "1"), ("arch", "noarch"), ("os", "linux")):
+            header[key] = value
+        header["requirename"] = [name]
+        header["requireversion"] = [version]
+        header["requireflags"] = [sense]
+        transaction = rpm.TransactionSet()
+        transaction.addInstall(header, "mbn-build-dependencies", "i")
+        # Check separately because the legacy problem tuples lose parts of
+        # rich dependency expressions. Only the pass/fail result is needed.
+        if transaction.check():
+            missing.append(requirement)
+    return missing
+
+
 def install_dependencies(requirements):
     if not requirements:
         return
-    missing = [r for r in requirements
-               if run(["rpm", "--query", "--whatprovides", r], check=False).returncode]
+    missing = missing_dependencies(requirements)
     if not missing:
         print("All declared build dependencies are already installed.")
         return
